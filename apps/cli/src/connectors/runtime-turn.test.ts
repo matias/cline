@@ -588,7 +588,7 @@ describe("createConnectorRuntimeTurnStream", () => {
 		};
 
 		const failures: string[] = [];
-		await expect(async () => {
+		await expect((async () => {
 			for await (const _chunk of createConnectorRuntimeTurnStream({
 				client: client as never,
 				sessionId: "session-1",
@@ -603,7 +603,7 @@ describe("createConnectorRuntimeTurnStream", () => {
 			})) {
 				// consume stream
 			}
-		}).rejects.toThrow("Invalid API key");
+		})()).rejects.toThrow("Invalid API key");
 
 		expect(failures).toEqual(["Invalid API key"]);
 	});
@@ -635,7 +635,7 @@ describe("createConnectorRuntimeTurnStream", () => {
 		};
 
 		const failures: string[] = [];
-		await expect(async () => {
+		await expect((async () => {
 			for await (const _chunk of createConnectorRuntimeTurnStream({
 				client: client as never,
 				sessionId: "session-1",
@@ -650,7 +650,7 @@ describe("createConnectorRuntimeTurnStream", () => {
 			})) {
 				// consume stream
 			}
-		}).rejects.toThrow("Invalid API key");
+		})()).rejects.toThrow("Invalid API key");
 
 		expect(failures).toEqual(["Invalid API key"]);
 	});
