@@ -380,6 +380,12 @@ type ConnectorUserTurnInput<TState extends ConnectorThreadState> = {
 		thread: Thread<TState>;
 		text: string;
 	}) => Promise<void>;
+	/**
+	 * Overrides how long a single Slack status message may be edited before it
+	 * rolls over to a fresh message in the thread. Defaults to nine minutes
+	 * (Slack's update window closes after roughly ten). Exposed for tests.
+	 */
+	statusMessageMaxAgeMs?: number;
 	createEmptyRuntimeReplyResolver?: EmptyRuntimeReplyResolverFactory;
 	onReplyCompleted?: (result: {
 		sessionId: string;
@@ -1202,6 +1208,14 @@ async function runConnectorRuntimeTurnWithRecovery<
 }
 
 /**
+ * How long a single Slack status message may be edited before the connector
+ * rolls its progress onto a fresh message in the same thread. Slack stops
+ * accepting updates to an in-flight message after roughly ten minutes, so we
+ * rotate well before that window closes.
+ */
+const SLACK_STATUS_MESSAGE_MAX_AGE_MS = 9 * 60 * 1000;
+
+/**
  * Runs a single connector turn against an already-resolved session and streams
  * the reply back into the thread.
  */
@@ -1229,11 +1243,67 @@ async function runConnectorRuntimeTurn<
 	input.activeTurns?.set(turnKey, activeTurn);
 	await input.thread.startTyping();
 	let toolStatusMessage: SentMessage | undefined;
-	const postFinalReply = input.postFinalReply
-		? async (text: string) => {
-				await input.postFinalReply?.({ thread: input.thread, text });
+	let toolStatusMessageFinalized = false;
+	let toolStatusMessageStartedAt = 0;
+	const statusMessageMaxAgeMs =
+		input.statusMessageMaxAgeMs ?? SLACK_STATUS_MESSAGE_MAX_AGE_MS;
+
+	const postToolStatusMessage = async (message: string): Promise<void> => {
+		toolStatusMessage = await postConnectorText(
+			input.thread,
+			input.transport,
+			message,
+		);
+		toolStatusMessageStartedAt = Date.now();
+	};
+
+	/**
+	 * Slack only accepts updates to a message for a limited window (roughly ten
+	 * minutes). Once the current progress message ages past that, further edits
+	 * are rejected, so a long-running turn has to roll its status onto a fresh
+	 * message in the same thread instead of editing the old one.
+	 */
+	const toolStatusMessageIsStale = (): boolean =>
+		input.transport === "slack" &&
+		!!toolStatusMessage &&
+		Date.now() - toolStatusMessageStartedAt >= statusMessageMaxAgeMs;
+
+	const postSlackFinalReply = async (text: string) => {
+		if (!text.trim()) {
+			return;
+		}
+		if (toolStatusMessage && !toolStatusMessageIsStale()) {
+			try {
+				toolStatusMessage = await toolStatusMessage.edit({ markdown: text });
+				toolStatusMessageFinalized = true;
+				return;
+			} catch (error) {
+				input.logger.core.log(
+					"Slack connector could not replace progress with the final reply",
+					{
+						severity: "warn",
+						transport: input.transport,
+						conversationId: input.thread.id,
+						sessionId,
+						error,
+					},
+				);
 			}
-		: undefined;
+		}
+		if (input.postFinalReply) {
+			await input.postFinalReply({ thread: input.thread, text });
+			return;
+		}
+		await input.thread.post({ markdown: text });
+	};
+	const postFinalReply =
+		input.transport === "slack"
+			? postSlackFinalReply
+			: input.postFinalReply
+				? async (text: string) => {
+						await input.postFinalReply?.({ thread: input.thread, text });
+					}
+				: undefined;
 	try {
 		await postConnectorRuntimeReply(
 			input.thread,
@@ -1248,6 +1318,10 @@ async function runConnectorRuntimeTurn<
 				conversationId: input.thread.id,
 				onToolStatus: async (message) => {
 					if (toolStatusMessage) {
+						if (toolStatusMessageIsStale()) {
+							await postToolStatusMessage(message);
+							return;
+						}
 						toolStatusMessage = await editConnectorText(
 							toolStatusMessage,
 							input.transport,
@@ -1255,11 +1329,7 @@ async function runConnectorRuntimeTurn<
 						);
 						return;
 					}
-					toolStatusMessage = await postConnectorText(
-						input.thread,
-						input.transport,
-						message,
-					);
+					await postToolStatusMessage(message);
 				},
 				onApprovalRequested: async (approval) => {
 					input.pendingApprovals.set(input.thread.id, approval);
@@ -1299,7 +1369,7 @@ async function runConnectorRuntimeTurn<
 		if (input.activeTurns?.get(turnKey) === activeTurn) {
 			input.activeTurns.delete(turnKey);
 		}
-		if (toolStatusMessage) {
+		if (toolStatusMessage && !toolStatusMessageFinalized) {
 			await toolStatusMessage.delete().catch(() => undefined);
 		}
 	}
